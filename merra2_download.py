@@ -90,8 +90,10 @@ def _stream(year: int) -> str:
 
 
 # ── credential helpers ─────────────────────────────────────────────────────────
-CRED_FILE = Path.home() / ".merra2_credentials.json"
+#CRED_FILE = Path.home() / ".merra2_credentials.json"
+CRED_FILE = Path()/ "merra2_credential.json"
 
+print(f'The credential should be here: {CRED_FILE.resolve()}')
 
 def load_credentials() -> tuple[str, str]:
     """Load NASA Earthdata credentials from env vars, cache file, or prompt."""
@@ -103,18 +105,9 @@ def load_credentials() -> tuple[str, str]:
 
     if CRED_FILE.exists():
         data = json.loads(CRED_FILE.read_text())
+        print('Credentials found')
         return data.get("user", ""), data.get("pass", "")
-
-    print("\nNASA Earthdata credentials required.")
-    print("Register free at: https://urs.earthdata.nasa.gov/\n")
-    user = input("Earthdata username: ").strip()
-    pwd = getpass.getpass("Earthdata password: ")
-
-    save = input("Save credentials to ~/.merra2_credentials.json? [y/N]: ").strip().lower()
-    if save == "y":
-        CRED_FILE.write_text(json.dumps({"user": user, "pass": pwd}))
-        CRED_FILE.chmod(0o600)
-        log.info("Credentials saved to %s", CRED_FILE)
+    print('Local credential not found')
 
     return user, pwd
 

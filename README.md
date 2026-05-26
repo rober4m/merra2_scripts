@@ -3,6 +3,11 @@
 Tools for geocoding city names and downloading MERRA-2 hourly meteorological data for multiple locations in parallel.
 
 ---
+**Dependencies**
+
+```bash
+pip install requests tqdm netCDF4 numpy pandas geopy
+```
 
 ## Scripts
 
@@ -44,12 +49,6 @@ lat,lon,name
 ```
 
 Cities that cannot be found are written with empty `lat`/`lon` values. The script retries automatically on rate-limit or timeout errors (exponential back-off, up to 6 attempts per city).
-
-**Dependencies**
-
-```bash
-pip install pandas geopy
-```
 
 ---
 
@@ -120,13 +119,6 @@ Or pass them directly with `--user` and `--password`. If neither is provided, `m
 
 > **Note:** NASA GES DISC may throttle clients with more than 8 simultaneous connections. If you see many `429` or `503` errors, reduce `--workers`.
 
-**Dependencies**
-
-```bash
-pip install requests tqdm netCDF4 numpy pandas
-```
-
----
 
 ## End-to-end workflow
 
