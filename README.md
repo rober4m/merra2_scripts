@@ -53,7 +53,7 @@ pip install pandas geopy
 
 ---
 
-### `merra2_parallel.py` — Download MERRA-2 data for multiple sites
+### `merra2_parallel.py` — Download MERRA-2 data for multiple sites [Default number = 5]
 
 Runs `merra2_download.py` in parallel for every location in a CSV file (or an inline list), downloading hourly MERRA-2 data from NASA GES DISC. Each site gets its own sub-folder and a `download.log` file.
 
@@ -64,7 +64,7 @@ Runs `merra2_download.py` in parallel for every location in a CSV file (or an in
 python merra2_parallel.py --locations city_coordinates.csv -o merra2_output
 
 # With parallel workers (default: 1; recommended: 4–12)
-python merra2_parallel.py --locations city_coordinates.csv -o merra2_output --workers 6
+python merra2_parallel.py --locations city_coordinates.csv -o merra2_output --workers 5
 
 # Inline locations (no CSV needed)
 python merra2_parallel.py --locations "40.54,-3.70 48.85,2.35 51.51,-0.13" -o merra2_output
@@ -79,7 +79,7 @@ python merra2_parallel.py --locations city_coordinates.csv -o merra2_output --ke
 |---|---|---|
 | `-l / --locations` | *(required)* | Path to CSV file (`lat,lon[,name]`) **or** inline string `"lat1,lon1 lat2,lon2 ..."` |
 | `-o / --output-dir` | `merra2_output` | Root output directory. A sub-folder is created per site. |
-| `-w / --workers` | `1` | Number of parallel downloads. Recommended: 4–12. Hard cap: 12. |
+| `-w / --workers` | `5` | Number of parallel downloads. Recommended: 4–12. Hard cap: 12. |
 | `--keep-nc4` | off | Keep raw `.nc4` files after data extraction. |
 | `--user` | env | NASA Earthdata username. Alternatively set `EARTHDATA_USER`. |
 | `--password` | env | NASA Earthdata password. Alternatively set `EARTHDATA_PASS`. |
