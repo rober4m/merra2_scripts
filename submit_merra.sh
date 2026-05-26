@@ -6,6 +6,9 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 
+# Path of the directory of the script
+cd /path/to/script/
+
 # Change NameofCondaEnv for the name of the conda enviroment with all the packages required. 
 # This is the path of the conda env
 $HOME/miniconda3/envs/{NameofCondaEnv}/bin/python merra2_parallel.py --locations city_coordinates.csv -o merra2_output
