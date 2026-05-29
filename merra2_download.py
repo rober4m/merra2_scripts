@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """
-MERRA-2 Hourly Data Downloader
-Downloads hourly data for a single lat/lon point from 1980 to present.
+MERRA-2 Hourly Data Downloader (OPeNDAP edition)
+Streams hourly data for a single lat/lon point from 1980 to present using
+GES DISC OPeNDAP server-side subsetting — no full .nc4 files are downloaded.
 
 Usage:
     python merra2_download.py -lat 40.54 -lon 5.25
 
 Requirements:
-    pip install requests tqdm netCDF4 numpy pandas
+    pip install requests xarray pydap numpy pandas tqdm
 
 Authentication:
     You need a NASA Earthdata account. Set credentials via environment variables:
         export EARTHDATA_USER=your_username
         export EARTHDATA_PASS=your_password
-    Or the script will prompt you interactively on first run and cache them.
+    Or the script will read them from ./merra2_credential.json.
 """
 
 import argparse
 import os
 import sys
-import time
 import getpass
 import json
 import logging
@@ -30,16 +30,39 @@ from pathlib import Path
 import requests
 from requests.auth import HTTPBasicAuth
 
-# ── optional heavy deps (imported lazily after install check) ──────────────────
+# ── required heavy deps ───────────────────────────────────────────────────────
 try:
     import numpy as np
     import pandas as pd
-    import netCDF4 as nc
-    from tqdm import tqdm
+    import xarray as xr
 except ImportError:
     print("Missing dependencies. Install with:")
-    print("  pip install requests tqdm netCDF4 numpy pandas")
+    print("  pip install requests xarray pydap numpy pandas tqdm")
     sys.exit(1)
+
+# pydap is required for OPeNDAP access through xarray
+try:
+    from pydap.client import open_url  # noqa: F401  (ensures pydap is importable)
+    import pydap  # noqa: F401
+except ImportError:
+    print("Missing dependency 'pydap'. Install with:")
+    print("  pip install pydap")
+    sys.exit(1)
+
+# pydap.cas.urs gives a session that handles the Earthdata Login redirect chain.
+# Fall back to plain HTTPBasicAuth if it's not available in this pydap build.
+try:
+    from pydap.cas.urs import setup_session as _urs_setup_session
+    _HAS_PYDAP_CAS = True
+except ImportError:
+    _urs_setup_session = None
+    _HAS_PYDAP_CAS = False
+
+# tqdm is optional — only used for progress display
+try:
+    from tqdm import tqdm  # noqa: F401
+except ImportError:
+    tqdm = None  # noqa: F401
 
 # ── logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -50,9 +73,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── MERRA-2 dataset configuration ─────────────────────────────────────────────
-# NASA GES DISC OPeNDAP base URL
-GESDISC_BASE = "https://goldsmr4.gesdisc.eosdis.nasa.gov/dods"
-
 # Each MERRA-2 collection and its variables
 # inst1_2d_asm_Nx  : single-level hourly instantaneous (surface/near-surface)
 # tavg1_2d_slv_Nx  : single-level hourly time-averaged
@@ -69,10 +89,10 @@ COLLECTIONS = {
     },
 }
 
-# OPeNDAP / HTTPS file URL templates
-# Files are organised as: COLLECTION/YYYY/DDD/filename
-FILE_URL_TMPL = (
-    "https://goldsmr4.gesdisc.eosdis.nasa.gov/data/MERRA2/{collection}/{year}/{month:02d}/"
+# OPeNDAP URL template — same path structure as the HTTPS file URL but under /opendap/
+# Files are organised as: COLLECTION/YYYY/MM/filename
+OPENDAP_URL_TMPL = (
+    "https://goldsmr4.gesdisc.eosdis.nasa.gov/opendap/MERRA2/{collection}/{year}/{month:02d}/"
     "MERRA2_{stream}.{shortname}.{date8}.nc4"
 )
 
@@ -91,7 +111,7 @@ def _stream(year: int) -> str:
 
 # ── credential helpers ─────────────────────────────────────────────────────────
 #CRED_FILE = Path.home() / ".merra2_credentials.json"
-CRED_FILE = Path()/ "merra2_credential.json"
+CRED_FILE = Path() / "merra2_credential.json"
 
 print(f'The credential should be here: {CRED_FILE.resolve()}')
 
@@ -131,7 +151,21 @@ class _EarthdataSession(requests.Session):
                 del headers["Authorization"]
 
 
-def make_session(user: str, pwd: str) -> requests.Session:
+def make_session(user: str, pwd: str, check_url: str | None = None) -> requests.Session:
+    """Build an authenticated session for NASA Earthdata OPeNDAP requests.
+
+    Prefers pydap.cas.urs.setup_session (which understands the Earthdata
+    Login redirect dance + cookie handling).  Falls back to a plain
+    requests.Session with HTTPBasicAuth if pydap.cas is unavailable.
+    """
+    if _HAS_PYDAP_CAS and check_url:
+        try:
+            session = _urs_setup_session(user, pwd, check_url=check_url)
+            return session
+        except Exception as exc:
+            log.warning("pydap.cas.urs.setup_session failed (%s); "
+                        "falling back to HTTPBasicAuth session.", exc)
+
     session = _EarthdataSession()
     session.auth = HTTPBasicAuth(user, pwd)
     return session
@@ -160,11 +194,27 @@ def actual_coords(lat_i: int, lon_i: int) -> tuple[float, float]:
 
 
 # ── URL builders ───────────────────────────────────────────────────────────────
-def daily_url(collection: str, shortname: str, year: int, month: int, day: int) -> str:
+def daily_opendap_url(
+    collection: str,
+    shortname: str,
+    year: int,
+    month: int,
+    day: int,
+    variables: list[str],
+    lat_i: int,
+    lon_i: int,
+) -> str:
+    """Build a MERRA-2 OPeNDAP URL with a server-side subsetting suffix.
+
+    The suffix restricts the response to:
+      - the hourly time steps [0:23] for each requested variable
+      - the single (lat_i, lon_i) grid cell
+      - the time/lat/lon coordinate arrays
+    """
     d = date(year, month, day)
     date8 = d.strftime("%Y%m%d")
     stream = _stream(year)
-    return FILE_URL_TMPL.format(
+    base = OPENDAP_URL_TMPL.format(
         collection=collection,
         year=year,
         month=month,
@@ -173,81 +223,65 @@ def daily_url(collection: str, shortname: str, year: int, month: int, day: int) 
         date8=date8,
     )
 
+    var_subset = ",".join(
+        f"{v}[0:23][{lat_i}:{lat_i}][{lon_i}:{lon_i}]" for v in variables
+    )
+    coord_subset = f"time[0:23],lat[{lat_i}:{lat_i}],lon[{lon_i}:{lon_i}]"
+    return f"{base}?{var_subset},{coord_subset}"
 
-# ── download helpers ───────────────────────────────────────────────────────────
-CHUNK = 1024 * 256   # 256 KB
 
-def download_file(
+# ── OPeNDAP point reader ──────────────────────────────────────────────────────
+def read_opendap_point(
     session: requests.Session,
     url: str,
-    dest: Path,
-    retries: int = 3,
-) -> bool:
-    """Download *url* to *dest*. Returns True on success."""
-    tmp = dest.with_suffix(".tmp")
-    for attempt in range(1, retries + 1):
-        try:
-            resp = session.get(url, stream=True, timeout=120)
-            if resp.status_code == 404:
-                log.warning("File not found (404): %s", url)
-                return False
-            resp.raise_for_status()
-
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            with tmp.open("wb") as fh:
-                for chunk in resp.iter_content(CHUNK):
-                    fh.write(chunk)
-            tmp.rename(dest)
-            return True
-
-        except KeyboardInterrupt:
-            if tmp.exists():
-                tmp.unlink()
-            raise
-        except (requests.RequestException, Exception) as exc:
-            log.warning("Attempt %d/%d failed for %s: %s", attempt, retries, url, exc)
-            if tmp.exists():
-                tmp.unlink()
-            if attempt < retries:
-                time.sleep(5 * attempt)
-
-    return False
-
-
-# ── extract point data from NetCDF4 ───────────────────────────────────────────
-def extract_point(
-    filepath: Path,
     lat_i: int,
     lon_i: int,
     variables: list[str],
 ) -> pd.DataFrame:
-    """Read a MERRA-2 daily NetCDF4 file and extract hourly data for one grid cell."""
-    with nc.Dataset(filepath) as ds:
-        # Time axis → real datetimes
-        time_var = ds.variables["time"]
-        times = nc.num2date(
-            time_var[:],
-            units=time_var.units,
-            calendar=getattr(time_var, "calendar", "standard"),
-            only_use_cftime_datetimes=False,
-            only_use_python_datetimes=True,
-        )
+    """Open a MERRA-2 OPeNDAP URL and return hourly data for one grid cell.
 
-        rows = {"datetime": list(times)}
+    Uses xarray + pydap with the supplied authenticated session. Only the
+    bytes for the requested variables and the single (lat_i, lon_i) cell
+    are transferred from the server.
+    """
+    # Prefer PydapDataStore.open when available — it accepts the requests.Session
+    # directly so the Earthdata cookies/auth carry through.
+    try:
+        from xarray.backends import PydapDataStore
+        store = PydapDataStore.open(url, session=session)
+        ds = xr.open_dataset(store)
+    except Exception:
+        # Older / newer xarray versions: pass session via engine kwargs.
+        ds = xr.open_dataset(url, engine="pydap", session=session)
+
+    with ds:
+        # Materialize a single grid point. The server has already subset to a
+        # 1×1 spatial slab; isel just collapses those length-1 dimensions.
+        try:
+            point = ds.isel(lat=0, lon=0)
+        except Exception:
+            # Fallback in case the dataset still carries the full grid (e.g.
+            # a server that ignored the projection clause).
+            point = ds.isel(lat=lat_i, lon=lon_i)
+
+        # Time axis → real datetimes via xarray's decoded coordinate
+        times = pd.to_datetime(point["time"].values)
+        rows: dict[str, list] = {"datetime": list(times)}
+
         for vname in variables:
-            if vname in ds.variables:
-                var = ds.variables[vname]
-                data = var[:, lat_i, lon_i]  # netCDF4 auto-applies scale/offset and masking
-                arr = np.ma.filled(np.ma.array(data, dtype=float), np.nan)
+            if vname in point.variables:
+                arr = np.asarray(point[vname].values, dtype=float)
+                # OPeNDAP fill values are typically already masked by xarray's
+                # decode_cf; coerce any remaining sentinel/NaN handling.
                 rows[vname] = arr.tolist()
             else:
-                log.debug("Variable %s not in file %s", vname, filepath.name)
+                log.debug("Variable %s not in OPeNDAP response for %s", vname, url)
 
     return pd.DataFrame(rows)
 
 
 # ── main download loop ─────────────────────────────────────────────────────────
-def run(lat: float, lon: float, output_dir: Path, keep_nc4: bool = False):
+def run(lat: float, lon: float, output_dir: Path):
     lat_i, lon_i = nearest_index(lat, lon)
     grid_lat, grid_lon = actual_coords(lat_i, lon_i)
     log.info("Requested point : lat=%.4f, lon=%.4f", lat, lon)
@@ -255,16 +289,23 @@ def run(lat: float, lon: float, output_dir: Path, keep_nc4: bool = False):
              grid_lat, lat_i, grid_lon, lon_i)
 
     user, pwd = load_credentials()
-    session = make_session(user, pwd)
 
+    # Build a check_url against the first collection / first available date so
+    # pydap.cas.urs.setup_session can complete the Earthdata Login handshake.
     start_year = 1980
+    first_collection = next(iter(COLLECTIONS))
+    first_meta = COLLECTIONS[first_collection]
+    first_url = daily_opendap_url(
+        first_collection,
+        first_meta["shortname"],
+        start_year, 1, 1,
+        first_meta["variables"],
+        lat_i, lon_i,
+    )
+    session = make_session(user, pwd, check_url=first_url)
+
     today = date.today()
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Remove stale .tmp files left by previous interrupted runs
-    for stale in output_dir.rglob("*.tmp"):
-        log.info("Removing stale temp file: %s", stale)
-        stale.unlink()
 
     all_frames: list[pd.DataFrame] = []
     month_frames: list[pd.DataFrame] = []  # kept outside try so interrupt handler can access it
@@ -296,23 +337,17 @@ def run(lat: float, lon: float, output_dir: Path, keep_nc4: bool = False):
                     for collection, meta in COLLECTIONS.items():
                         shortname = meta["shortname"]
                         variables = meta["variables"]
-                        url = daily_url(collection, shortname, year, month, day)
-
-                        nc4_path = output_dir / "nc4" / f"{shortname}_{year}{month:02d}{day:02d}.nc4"
-
-                        if not nc4_path.exists():
-                            ok = download_file(session, url, nc4_path)
-                            if not ok:
-                                continue
+                        url = daily_opendap_url(
+                            collection, shortname, year, month, day,
+                            variables, lat_i, lon_i,
+                        )
 
                         try:
-                            df = extract_point(nc4_path, lat_i, lon_i, variables)
+                            df = read_opendap_point(session, url, lat_i, lon_i, variables)
                             day_frames.append(df)
                         except Exception as exc:
-                            log.warning("Could not parse %s: %s", nc4_path, exc)
-
-                        if not keep_nc4 and nc4_path.exists():
-                            nc4_path.unlink()
+                            log.warning("OPeNDAP read failed for %s: %s", url, exc)
+                            continue
 
                     if day_frames:
                         # Merge all collections for this day on datetime
@@ -367,7 +402,7 @@ def run(lat: float, lon: float, output_dir: Path, keep_nc4: bool = False):
 # ── CLI ────────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Download MERRA-2 hourly data for a single lat/lon point (1980–present).",
+        description="Download MERRA-2 hourly data for a single lat/lon point (1980–present) via OPeNDAP.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("-lat", type=float, required=True, help="Latitude  (-90 to 90)")
@@ -377,12 +412,6 @@ def parse_args():
         type=Path,
         default=Path("merra2_output"),
         help="Directory for output CSV files",
-    )
-    p.add_argument(
-        "--keep-nc4",
-        action="store_true",
-        default=False,
-        help="Keep downloaded .nc4 files after extraction (large!)",
     )
     return p.parse_args()
 
@@ -401,5 +430,4 @@ if __name__ == "__main__":
         lat=args.lat,
         lon=args.lon,
         output_dir=args.output_dir,
-        keep_nc4=args.keep_nc4,
     )

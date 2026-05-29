@@ -85,7 +85,7 @@ def parse_locations(source: str) -> list[dict]:
 
 # ── worker ────────────────────────────────────────────────────────────────────
 
-def download_one(loc: dict, output_root: Path, keep_nc4: bool, extra_args: list[str]) -> dict:
+def download_one(loc: dict, output_root: Path, extra_args: list[str]) -> dict:
     """Spawn merra2_download.py as a subprocess for one location."""
     name = loc["name"]
     lat  = loc["lat"]
@@ -102,8 +102,6 @@ def download_one(loc: dict, output_root: Path, keep_nc4: bool, extra_args: list[
         "-lon", str(lon),
         "-o", str(site_dir),
     ]
-    if keep_nc4:
-        cmd.append("--keep-nc4")
     cmd.extend(extra_args)
 
     started = time.time()
@@ -145,7 +143,7 @@ def print_summary(results: list[dict], total_elapsed: float):
     bad = [r for r in results if not r["success"]]
 
     print("\n" + "=" * 60)
-    print(f"  MERRA-2 parallel download summary")
+    print(f"  MERRA-2 parallel summary")
     print(f"  Wall-clock time : {total_elapsed/60:.1f} min")
     print(f"  Succeeded       : {len(ok)}/{len(results)}")
     print("=" * 60)
@@ -178,16 +176,12 @@ def parse_args():
         ),
     )
     p.add_argument(
-        "--workers", "-w", type=int, default=5,
+        "--workers", "-w", type=int, default=2,
         help="Number of parallel downloads (recommended: 4–12)",
     )
     p.add_argument(
         "--output-dir", "-o", type=Path, default=Path("merra2_output"),
         help="Root output directory; a sub-folder is created per site",
-    )
-    p.add_argument(
-        "--keep-nc4", action="store_true", default=False,
-        help="Keep raw .nc4 files after extraction",
     )
     # Credentials can also be passed as args (forwarded to child scripts)
     p.add_argument("--user", help="NASA Earthdata username (or set EARTHDATA_USER)")
@@ -230,7 +224,7 @@ def main():
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(download_one, loc, args.output_dir, args.keep_nc4, []): loc
+            pool.submit(download_one, loc, args.output_dir, []): loc
             for loc in locations
         }
         for fut in as_completed(futures):

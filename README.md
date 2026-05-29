@@ -1,12 +1,12 @@
 # MERRA-2 Parallel Downloader
 
-Tools for geocoding city names and downloading MERRA-2 hourly meteorological data for multiple locations in parallel.
+Tools for geocoding city names and streaming MERRA-2 hourly meteorological data for multiple locations in parallel via OPeNDAP — no full `.nc4` files are downloaded.
 
 ---
 **Dependencies**
 
 ```bash
-pip install requests tqdm netCDF4 numpy pandas geopy
+pip install requests xarray pydap numpy pandas tqdm geopy
 ```
 
 ## Scripts
@@ -52,9 +52,9 @@ Cities that cannot be found are written with empty `lat`/`lon` values. The scrip
 
 ---
 
-### `merra2_parallel.py` — Download MERRA-2 data for multiple sites
+### `merra2_parallel.py` — Stream MERRA-2 data for multiple sites
 
-Runs `merra2_download.py` in parallel (default=5) for every location in a CSV file (or an inline list), downloading hourly MERRA-2 data from NASA GES DISC. Each site gets its own sub-folder and a `download.log` file.
+Runs `merra2_download.py` in parallel (default=5) for every location in a CSV file (or an inline list), streaming hourly MERRA-2 data from NASA GES DISC via OPeNDAP. Each site gets its own sub-folder and a `download.log` file.
 
 **Usage**
 
@@ -62,14 +62,11 @@ Runs `merra2_download.py` in parallel (default=5) for every location in a CSV fi
 # From a coordinates CSV (output of lan_lon_city.py)
 python merra2_parallel.py --locations city_coordinates.csv -o merra2_output
 
-# With parallel workers (default: 1; recommended: 4–12)
+# With parallel workers (default: 2; recommended: 4–12)
 python merra2_parallel.py --locations city_coordinates.csv -o merra2_output --workers 5
 
 # Inline locations (no CSV needed)
 python merra2_parallel.py --locations "40.54,-3.70 48.85,2.35 51.51,-0.13" -o merra2_output
-
-# Keep raw .nc4 files after extraction
-python merra2_parallel.py --locations city_coordinates.csv -o merra2_output --keep-nc4
 ```
 
 **Arguments**
@@ -78,8 +75,7 @@ python merra2_parallel.py --locations city_coordinates.csv -o merra2_output --ke
 |---|---|---|
 | `-l / --locations` | *(required)* | Path to CSV file (`lat,lon[,name]`) **or** inline string `"lat1,lon1 lat2,lon2 ..."` |
 | `-o / --output-dir` | `merra2_output` | Root output directory. A sub-folder is created per site. |
-| `-w / --workers` | `5` | Number of parallel downloads. Recommended: 4–12. Hard cap: 12. |
-| `--keep-nc4` | off | Keep raw `.nc4` files after data extraction. |
+| `-w / --workers` | `2` | Number of parallel workers. Recommended: 4–12. Hard cap: 12. |
 
 **CSV format accepted by `--locations`**
 
@@ -97,7 +93,7 @@ lat,lon,name
 merra2_output/
 ├── Antwerp/
 │   ├── download.log
-│   └── *.csv          ← extracted hourly data
+│   └── *.csv          ← hourly data streamed from OPeNDAP
 ├── Paris/
 │   ├── download.log
 │   └── *.csv
@@ -106,9 +102,20 @@ merra2_output/
 
 **Authentication**
 
-A free [NASA Earthdata](https://urs.earthdata.nasa.gov/) account is required. Save credentials in merra2_credential.json before running.
+A free [NASA Earthdata](https://urs.earthdata.nasa.gov/) account is required. Save credentials in `merra2_credential.json` before running:
 
-Or pass them directly with `--user` and `--password`. If neither is provided, `merra2_download.py` will prompt interactively on the first run and cache the credentials locally.
+```json
+{"user": "your_username", "pass": "your_password"}
+```
+
+Or export them as environment variables:
+
+```bash
+export EARTHDATA_USER=your_username
+export EARTHDATA_PASS=your_password
+```
+
+Or pass them directly with `--user` and `--password`.
 
 > **Note:** NASA GES DISC may throttle clients with more than 8 simultaneous connections. If you see many `429` or `503` errors, reduce `--workers`.
 
@@ -119,6 +126,6 @@ Or pass them directly with `--user` and `--password`. If neither is provided, `m
 # 1. Geocode your cities
 python lan_lon_city.py city_names.csv -o city_coordinates.csv
 
-# 2. Download MERRA-2 data for all cities in parallel
+# 2. Stream MERRA-2 data for all cities in parallel via OPeNDAP
 python merra2_parallel.py --locations city_coordinates.csv -o merra2_output --workers 6
 ```
