@@ -176,7 +176,7 @@ def parse_args():
         ),
     )
     p.add_argument(
-        "--workers", "-w", type=int, default=2,
+        "--workers", "-w", type=int, default=7,
         help="Number of parallel downloads (recommended: 4–12)",
     )
     p.add_argument(

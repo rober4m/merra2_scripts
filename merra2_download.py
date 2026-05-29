@@ -2,67 +2,44 @@
 """
 MERRA-2 Hourly Data Downloader (OPeNDAP edition)
 Streams hourly data for a single lat/lon point from 1980 to present using
-GES DISC OPeNDAP server-side subsetting — no full .nc4 files are downloaded.
+the GES DISC OPeNDAP server, accessed directly through xarray's netCDF4
+backend (libcurl/libnetcdf handles the OPeNDAP protocol).
 
 Usage:
     python merra2_download.py -lat 40.54 -lon 5.25
+    python merra2_download.py --locations city_coordinates.csv -o merra2_output
 
 Requirements:
-    pip install requests xarray pydap numpy pandas tqdm
+    pip install xarray netCDF4 numpy pandas
 
 Authentication:
-    You need a NASA Earthdata account. Set credentials via environment variables:
-        export EARTHDATA_USER=your_username
-        export EARTHDATA_PASS=your_password
-    Or the script will read them from ./merra2_credential.json.
+    You need a NASA Earthdata account. Credentials are read from ~/.netrc
+    (libcurl picks them up automatically). Your ~/.netrc should contain:
+
+        machine urs.earthdata.nasa.gov login YOUR_USER password YOUR_PASS
+
+    and have permissions 600. A ~/.dodsrc pointing at a cookie jar is also
+    recommended for OPeNDAP session reuse.
 """
 
 import argparse
-import os
+import csv
 import sys
-import getpass
-import json
 import logging
 import calendar
-from datetime import date, datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
 from pathlib import Path
-
-import requests
-from requests.auth import HTTPBasicAuth
 
 # ── required heavy deps ───────────────────────────────────────────────────────
 try:
-    import numpy as np
+    import numpy as np  # noqa: F401
     import pandas as pd
     import xarray as xr
 except ImportError:
     print("Missing dependencies. Install with:")
-    print("  pip install requests xarray pydap numpy pandas tqdm")
+    print("  pip install xarray netCDF4 numpy pandas")
     sys.exit(1)
-
-# pydap is required for OPeNDAP access through xarray
-try:
-    from pydap.client import open_url  # noqa: F401  (ensures pydap is importable)
-    import pydap  # noqa: F401
-except ImportError:
-    print("Missing dependency 'pydap'. Install with:")
-    print("  pip install pydap")
-    sys.exit(1)
-
-# pydap.cas.urs gives a session that handles the Earthdata Login redirect chain.
-# Fall back to plain HTTPBasicAuth if it's not available in this pydap build.
-try:
-    from pydap.cas.urs import setup_session as _urs_setup_session
-    _HAS_PYDAP_CAS = True
-except ImportError:
-    _urs_setup_session = None
-    _HAS_PYDAP_CAS = False
-
-# tqdm is optional — only used for progress display
-try:
-    from tqdm import tqdm  # noqa: F401
-except ImportError:
-    tqdm = None  # noqa: F401
 
 # ── logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -109,68 +86,6 @@ def _stream(year: int) -> str:
         return "400"
 
 
-# ── credential helpers ─────────────────────────────────────────────────────────
-#CRED_FILE = Path.home() / ".merra2_credentials.json"
-CRED_FILE = Path() / "merra2_credential.json"
-
-print(f'The credential should be here: {CRED_FILE.resolve()}')
-
-def load_credentials() -> tuple[str, str]:
-    """Load NASA Earthdata credentials from env vars, cache file, or prompt."""
-    user = os.environ.get("EARTHDATA_USER", "")
-    pwd = os.environ.get("EARTHDATA_PASS", "")
-
-    if user and pwd:
-        return user, pwd
-
-    if CRED_FILE.exists():
-        data = json.loads(CRED_FILE.read_text())
-        print('Credentials found')
-        return data.get("user", ""), data.get("pass", "")
-    print('Local credential not found')
-
-    return user, pwd
-
-
-# ── session with authentication ────────────────────────────────────────────────
-class _EarthdataSession(requests.Session):
-    """requests.Session that keeps auth alive when redirected to Earthdata Login.
-
-    By default requests strips the Authorization header on cross-domain
-    redirects, so credentials never reach urs.earthdata.nasa.gov.  This
-    override preserves auth specifically for that host.
-    """
-    _AUTH_HOST = "urs.earthdata.nasa.gov"
-
-    def rebuild_auth(self, prepared_request, response):
-        headers = prepared_request.headers
-        if "Authorization" in headers:
-            orig = requests.utils.urlparse(response.request.url).hostname
-            dest = requests.utils.urlparse(prepared_request.url).hostname
-            if orig != dest and dest != self._AUTH_HOST and orig != self._AUTH_HOST:
-                del headers["Authorization"]
-
-
-def make_session(user: str, pwd: str, check_url: str | None = None) -> requests.Session:
-    """Build an authenticated session for NASA Earthdata OPeNDAP requests.
-
-    Prefers pydap.cas.urs.setup_session (which understands the Earthdata
-    Login redirect dance + cookie handling).  Falls back to a plain
-    requests.Session with HTTPBasicAuth if pydap.cas is unavailable.
-    """
-    if _HAS_PYDAP_CAS and check_url:
-        try:
-            session = _urs_setup_session(user, pwd, check_url=check_url)
-            return session
-        except Exception as exc:
-            log.warning("pydap.cas.urs.setup_session failed (%s); "
-                        "falling back to HTTPBasicAuth session.", exc)
-
-    session = _EarthdataSession()
-    session.auth = HTTPBasicAuth(user, pwd)
-    return session
-
-
 # ── nearest grid point ─────────────────────────────────────────────────────────
 # MERRA-2 grid: 0.625° lon × 0.5° lat
 LON_RES = 0.625
@@ -193,28 +108,13 @@ def actual_coords(lat_i: int, lon_i: int) -> tuple[float, float]:
     return lat, lon
 
 
-# ── URL builders ───────────────────────────────────────────────────────────────
-def daily_opendap_url(
-    collection: str,
-    shortname: str,
-    year: int,
-    month: int,
-    day: int,
-    variables: list[str],
-    lat_i: int,
-    lon_i: int,
-) -> str:
-    """Build a MERRA-2 OPeNDAP URL with a server-side subsetting suffix.
-
-    The suffix restricts the response to:
-      - the hourly time steps [0:23] for each requested variable
-      - the single (lat_i, lon_i) grid cell
-      - the time/lat/lon coordinate arrays
-    """
+# ── URL builder ────────────────────────────────────────────────────────────────
+def _build_url(collection: str, shortname: str, year: int, month: int, day: int) -> str:
+    """Build a MERRA-2 OPeNDAP .nc4 base URL (no subsetting suffix)."""
     d = date(year, month, day)
     date8 = d.strftime("%Y%m%d")
     stream = _stream(year)
-    base = OPENDAP_URL_TMPL.format(
+    return OPENDAP_URL_TMPL.format(
         collection=collection,
         year=year,
         month=month,
@@ -223,61 +123,28 @@ def daily_opendap_url(
         date8=date8,
     )
 
-    var_subset = ",".join(
-        f"{v}[0:23][{lat_i}:{lat_i}][{lon_i}:{lon_i}]" for v in variables
-    )
-    coord_subset = f"time[0:23],lat[{lat_i}:{lat_i}],lon[{lon_i}:{lon_i}]"
-    return f"{base}?{var_subset},{coord_subset}"
 
-
-# ── OPeNDAP point reader ──────────────────────────────────────────────────────
-def read_opendap_point(
-    session: requests.Session,
-    url: str,
-    lat_i: int,
-    lon_i: int,
-    variables: list[str],
-) -> pd.DataFrame:
-    """Open a MERRA-2 OPeNDAP URL and return hourly data for one grid cell.
-
-    Uses xarray + pydap with the supplied authenticated session. Only the
-    bytes for the requested variables and the single (lat_i, lon_i) cell
-    are transferred from the server.
-    """
-    # Prefer PydapDataStore.open when available — it accepts the requests.Session
-    # directly so the Earthdata cookies/auth carry through.
-    try:
-        from xarray.backends import PydapDataStore
-        store = PydapDataStore.open(url, session=session)
-        ds = xr.open_dataset(store)
-    except Exception:
-        # Older / newer xarray versions: pass session via engine kwargs.
-        ds = xr.open_dataset(url, engine="pydap", session=session)
-
-    with ds:
-        # Materialize a single grid point. The server has already subset to a
-        # 1×1 spatial slab; isel just collapses those length-1 dimensions.
+# ── per-day fetcher ───────────────────────────────────────────────────────────
+def _fetch_day(year: int, month: int, day: int, lat_i: int, lon_i: int) -> pd.DataFrame | None:
+    day_frames = []
+    for collection, meta in COLLECTIONS.items():
+        url = _build_url(collection, meta["shortname"], year, month, day)
+        variables = meta["variables"]
         try:
-            point = ds.isel(lat=0, lon=0)
-        except Exception:
-            # Fallback in case the dataset still carries the full grid (e.g.
-            # a server that ignored the projection clause).
-            point = ds.isel(lat=lat_i, lon=lon_i)
-
-        # Time axis → real datetimes via xarray's decoded coordinate
-        times = pd.to_datetime(point["time"].values)
-        rows: dict[str, list] = {"datetime": list(times)}
-
-        for vname in variables:
-            if vname in point.variables:
-                arr = np.asarray(point[vname].values, dtype=float)
-                # OPeNDAP fill values are typically already masked by xarray's
-                # decode_cf; coerce any remaining sentinel/NaN handling.
-                rows[vname] = arr.tolist()
-            else:
-                log.debug("Variable %s not in OPeNDAP response for %s", vname, url)
-
-    return pd.DataFrame(rows)
+            ds = xr.open_dataset(url, engine="pydap")
+            df = ds[variables].isel(lat=lat_i, lon=lon_i).to_dataframe().reset_index()
+            df = df.rename(columns={"time": "datetime"})
+            df = df.drop(columns=[c for c in ("lat", "lon") if c in df.columns])
+            day_frames.append(df)
+            ds.close()
+        except Exception as exc:
+            log.warning("Failed %04d-%02d-%02d %s: %s", year, month, day, collection, exc)
+    if not day_frames:
+        return None
+    merged = day_frames[0]
+    for extra in day_frames[1:]:
+        merged = merged.merge(extra, on="datetime", how="outer")
+    return merged
 
 
 # ── main download loop ─────────────────────────────────────────────────────────
@@ -288,22 +155,7 @@ def run(lat: float, lon: float, output_dir: Path):
     log.info("Nearest MERRA-2 : lat=%.3f (idx %d), lon=%.3f (idx %d)",
              grid_lat, lat_i, grid_lon, lon_i)
 
-    user, pwd = load_credentials()
-
-    # Build a check_url against the first collection / first available date so
-    # pydap.cas.urs.setup_session can complete the Earthdata Login handshake.
     start_year = 1980
-    first_collection = next(iter(COLLECTIONS))
-    first_meta = COLLECTIONS[first_collection]
-    first_url = daily_opendap_url(
-        first_collection,
-        first_meta["shortname"],
-        start_year, 1, 1,
-        first_meta["variables"],
-        lat_i, lon_i,
-    )
-    session = make_session(user, pwd, check_url=first_url)
-
     today = date.today()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -331,33 +183,24 @@ def run(lat: float, lon: float, output_dir: Path):
                 log.info("Processing %04d-%02d …", year, month)
                 month_frames = []
 
-                for day in range(1, end_day + 1):
-                    day_frames: list[pd.DataFrame] = []
-
-                    for collection, meta in COLLECTIONS.items():
-                        shortname = meta["shortname"]
-                        variables = meta["variables"]
-                        url = daily_opendap_url(
-                            collection, shortname, year, month, day,
-                            variables, lat_i, lon_i,
-                        )
-
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    futures = {
+                        pool.submit(_fetch_day, year, month, day, lat_i, lon_i): day
+                        for day in range(1, end_day + 1)
+                    }
+                    for future in as_completed(futures):
+                        day = futures[future]
                         try:
-                            df = read_opendap_point(session, url, lat_i, lon_i, variables)
-                            day_frames.append(df)
+                            df = future.result()
+                            if df is not None:
+                                month_frames.append(df)
                         except Exception as exc:
-                            log.warning("OPeNDAP read failed for %s: %s", url, exc)
-                            continue
-
-                    if day_frames:
-                        # Merge all collections for this day on datetime
-                        day_df = day_frames[0]
-                        for extra in day_frames[1:]:
-                            day_df = day_df.merge(extra, on="datetime", how="outer")
-                        month_frames.append(day_df)
+                            log.warning("Day %04d-%02d-%02d failed: %s", year, month, day, exc)
 
                 if month_frames:
                     month_df = pd.concat(month_frames, ignore_index=True)
+                    month_df.sort_values("datetime", inplace=True)
+                    month_df.reset_index(drop=True, inplace=True)
                     month_df.to_csv(month_csv, index=False)
                     log.info("  → saved %s (%d rows)", month_csv.name, len(month_df))
                     all_frames.append(month_df)
@@ -399,14 +242,32 @@ def run(lat: float, lon: float, output_dir: Path):
     return out_csv
 
 
+# ── CSV location parser ────────────────────────────────────────────────────────
+def _parse_locations_csv(path: Path) -> list[dict]:
+    locs = []
+    with path.open() as fh:
+        reader = csv.DictReader(fh)
+        for i, row in enumerate(reader):
+            lat = float(row.get("lat") or row.get("latitude") or "")
+            lon = float(row.get("lon") or row.get("longitude") or "")
+            name = (row.get("name") or row.get("site") or f"site_{i+1:03d}").strip()
+            locs.append({"lat": lat, "lon": lon, "name": name})
+    return locs
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Download MERRA-2 hourly data for a single lat/lon point (1980–present) via OPeNDAP.",
+        description="Download MERRA-2 hourly data via OPeNDAP (1980–present).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("-lat", type=float, required=True, help="Latitude  (-90 to 90)")
-    p.add_argument("-lon", type=float, required=True, help="Longitude (-180 to 180)")
+    loc = p.add_mutually_exclusive_group(required=True)
+    loc.add_argument("-lat", type=float, help="Latitude (-90 to 90) — use with -lon")
+    loc.add_argument(
+        "--locations", type=Path, metavar="CSV",
+        help="CSV file with columns: lat, lon[, name] — downloads all rows",
+    )
+    p.add_argument("-lon", type=float, help="Longitude (-180 to 180) — required with -lat")
     p.add_argument(
         "-o", "--output-dir",
         type=Path,
@@ -419,15 +280,27 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    if not (-90 <= args.lat <= 90):
-        print("ERROR: latitude must be between -90 and 90")
-        sys.exit(1)
-    if not (-180 <= args.lon <= 180):
-        print("ERROR: longitude must be between -180 and 180")
-        sys.exit(1)
-
-    run(
-        lat=args.lat,
-        lon=args.lon,
-        output_dir=args.output_dir,
-    )
+    if args.locations:
+        locs = _parse_locations_csv(args.locations)
+        if not locs:
+            print("ERROR: No valid locations found in CSV.")
+            sys.exit(1)
+        log.info("Loaded %d location(s) from %s", len(locs), args.locations)
+        for loc in locs:
+            log.info("--- %s (lat=%.4f, lon=%.4f) ---", loc["name"], loc["lat"], loc["lon"])
+            run(
+                lat=loc["lat"],
+                lon=loc["lon"],
+                output_dir=args.output_dir / loc["name"].replace(" ", "_"),
+            )
+    else:
+        if args.lon is None:
+            print("ERROR: -lon is required when using -lat")
+            sys.exit(1)
+        if not (-90 <= args.lat <= 90):
+            print("ERROR: latitude must be between -90 and 90")
+            sys.exit(1)
+        if not (-180 <= args.lon <= 180):
+            print("ERROR: longitude must be between -180 and 180")
+            sys.exit(1)
+        run(lat=args.lat, lon=args.lon, output_dir=args.output_dir)
