@@ -56,8 +56,8 @@ log = logging.getLogger(__name__)
 COLLECTIONS = {
     "M2I1NXASM.5.12.4": {
         "shortname": "inst1_2d_asm_Nx",
-        "variables": ["T2M", "QV2M", "U10M", "V10M", "PS", "TQV"],
-        "label": "Instantaneous surface/near-surface (T, humidity, wind, pressure)",
+        "variables": ["T2M", "QV2M", "U10M", "V10M", "U100M", "V100M", "PS", "TQV"],
+        "label": "Instantaneous surface/near-surface (T, humidity, wind 10m & 100m, pressure)",
     },
     "M2T1NXSLV.5.12.4": {
         "shortname": "tavg1_2d_slv_Nx",
