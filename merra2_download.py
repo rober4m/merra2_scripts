@@ -56,20 +56,23 @@ log = logging.getLogger(__name__)
 COLLECTIONS = {
     "M2I1NXASM.5.12.4": {
         "shortname": "inst1_2d_asm_Nx",
-        "variables": ["T2M", "QV2M", "U10M", "V10M", "U100M", "V100M", "PS", "TQV"],
-        "label": "Instantaneous surface/near-surface (T, humidity, wind 10m & 100m, pressure)",
+        "variables": ["T2M", "QV2M", "U10M", "V10M", "U50M", "V50M", "PS", "TQV"],
+        "label": "Instantaneous surface/near-surface (T, humidity, wind 10m & 50m, pressure)",
     },
     "M2T1NXSLV.5.12.4": {
         "shortname": "tavg1_2d_slv_Nx",
-        "variables": ["T2MMAX", "T2MMIN", "PRECTOT", "SWGDN", "LWGDN"],
-        "label": "Time-averaged single-level (precip, radiation, T extremes)",
+        "variables": ["T2M", "PRECTOT", "SWGDN", "LWGDN"],
+        "label": "Time-averaged single-level (T, precip, radiation)",
     },
 }
 
 # OPeNDAP URL template — same path structure as the HTTPS file URL but under /opendap/
 # Files are organised as: COLLECTION/YYYY/MM/filename
+# Use the dap4:// scheme so PyDAP skips protocol auto-detection and uses the
+# modern DAP4 protocol (chunked/compressed responses, better performance) which
+# NASA GES DISC servers have supported since ~2016.
 OPENDAP_URL_TMPL = (
-    "https://goldsmr4.gesdisc.eosdis.nasa.gov/opendap/MERRA2/{collection}/{year}/{month:02d}/"
+    "dap4://goldsmr4.gesdisc.eosdis.nasa.gov/opendap/MERRA2/{collection}/{year}/{month:02d}/"
     "MERRA2_{stream}.{shortname}.{date8}.nc4"
 )
 
@@ -132,6 +135,9 @@ def _fetch_day(year: int, month: int, day: int, lat_i: int, lon_i: int) -> pd.Da
         variables = meta["variables"]
         try:
             ds = xr.open_dataset(url, engine="pydap")
+            rename_map = {k: k.lstrip('/') for k in list(ds.dims) + list(ds.coords) if k.startswith('/')}
+            if rename_map:
+                ds = ds.rename(rename_map)
             df = ds[variables].isel(lat=lat_i, lon=lon_i).to_dataframe().reset_index()
             df = df.rename(columns={"time": "datetime"})
             df = df.drop(columns=[c for c in ("lat", "lon") if c in df.columns])
