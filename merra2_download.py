@@ -52,17 +52,17 @@ log = logging.getLogger(__name__)
 # ── MERRA-2 dataset configuration ─────────────────────────────────────────────
 # Each MERRA-2 collection and its variables
 # inst1_2d_asm_Nx  : single-level hourly instantaneous (surface/near-surface)
-# tavg1_2d_slv_Nx  : single-level hourly time-averaged
+# tavg1_2d_flx_Nx  : single-level hourly time-averaged surface flux
 COLLECTIONS = {
     "M2I1NXASM.5.12.4": {
         "shortname": "inst1_2d_asm_Nx",
         "variables": ["T2M", "QV2M", "U10M", "V10M", "U50M", "V50M", "PS", "TQV"],
         "label": "Instantaneous surface/near-surface (T, humidity, wind 10m & 50m, pressure)",
     },
-    "M2T1NXSLV.5.12.4": {
-        "shortname": "tavg1_2d_slv_Nx",
-        "variables": ["T2M", "PRECTOT", "SWGDN", "LWGDN"],
-        "label": "Time-averaged single-level (T, precip, radiation)",
+    "M2T1NXFLX.5.12.4": {
+        "shortname": "tavg1_2d_flx_Nx",
+        "variables": ["PRECTOT"],
+        "label": "Time-averaged surface flux (precipitation)",
     },
 }
 
@@ -135,12 +135,21 @@ def _fetch_day(year: int, month: int, day: int, lat_i: int, lon_i: int) -> pd.Da
         variables = meta["variables"]
         try:
             ds = xr.open_dataset(url, engine="pydap")
-            rename_map = {k: k.lstrip('/') for k in list(ds.dims) + list(ds.coords) if k.startswith('/')}
+            # pydap returns dim/coord/variable names with a leading '/' — strip them all
+            rename_map = {
+                k: k.lstrip('/')
+                for k in list(ds.dims) + list(ds.coords) + list(ds.data_vars)
+                if k.startswith('/')
+            }
             if rename_map:
                 ds = ds.rename(rename_map)
             df = ds[variables].isel(lat=lat_i, lon=lon_i).to_dataframe().reset_index()
             df = df.rename(columns={"time": "datetime"})
             df = df.drop(columns=[c for c in ("lat", "lon") if c in df.columns])
+            # pydap skips CF time decoding — convert raw hour-of-day integers to timestamps
+            if not pd.api.types.is_datetime64_any_dtype(df["datetime"]):
+                base = pd.Timestamp(year=year, month=month, day=day)
+                df["datetime"] = base + pd.to_timedelta(df["datetime"], unit="h")
             day_frames.append(df)
             ds.close()
         except Exception as exc:
@@ -207,7 +216,7 @@ def run(lat: float, lon: float, output_dir: Path):
                     month_df = pd.concat(month_frames, ignore_index=True)
                     month_df.sort_values("datetime", inplace=True)
                     month_df.reset_index(drop=True, inplace=True)
-                    month_df.to_csv(month_csv, index=False)
+                    month_df.to_csv(month_csv, index=False, date_format="%Y-%m-%d %H:%M:%S")
                     log.info("  → saved %s (%d rows)", month_csv.name, len(month_df))
                     all_frames.append(month_df)
                     month_frames = []
@@ -232,7 +241,7 @@ def run(lat: float, lon: float, output_dir: Path):
     full_df.reset_index(drop=True, inplace=True)
 
     out_csv = output_dir / f"merra2_hourly_lat{lat:.4f}_lon{lon:.4f}_1980_{today.year}.csv"
-    full_df.to_csv(out_csv, index=False)
+    full_df.to_csv(out_csv, index=False, date_format="%Y-%m-%d %H:%M:%S")
     log.info("=" * 60)
     log.info("Complete dataset saved → %s", out_csv)
     log.info("Total records: %d (expected ~%d hourly steps)",
