@@ -11,5 +11,5 @@ cd /path/to/script/
 
 # Change NameofCondaEnv for the name of the conda enviroment with all the packages required. 
 # This is the path of the conda env
-$HOME/miniconda3/envs/{NameofCondaEnv}/bin/python merra2_parallel.py --locations city_coordinates.csv -o merra2_output --workers 8
+$HOME/miniconda3/envs/{NameofCondaEnv}/bin/python merra2_parallel.py -l city_coordinates.csv -o merra2_output --workers 8
  
