@@ -1,0 +1,62 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MERRA-2 downloader User Configuration  ← Edit this section before running
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# ── Commands ─────────────────────────────────────────────────────────────────
+# Run each step in order with:
+#   python run_era5.py -o download   -c settings_scz.yml   # fetch NetCDF files from CDS
+#   python merra2_parallel.py -l city_coordinates.csv -o output_antwerpen --workers 1
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Time ─────────────────────────────────────────────────────────────────────
+date_start: 01-01-2000
+date_end:   31-12-2025
+name: antwerpen
+
+# ── Variables ─────────────────────────────────────────────────────────────────
+# One or more variables (one CDS request per variable):
+#   2m_temperature                     2m_dewpoint_temperature
+#   total_precipitation
+#   10m_u_component_of_wind            10m_v_component_of_wind
+#   100m_u_component_of_wind           100m_v_component_of_wind
+#   surface_solar_radiation_downwards  surface_net_solar_radiation
+#   skin_temperature
+variables: ["2m_temperature", "10m_u_component_of_wind", "10m_v_component_of_wind"]
+
+# ── Domain mode ──────────────────────────────────────────────────────────────
+# "point"  → nearest grid cell to lat/lon
+# "area"   → bounding box
+mode: point
+
+# Point settings (used when mode = point)
+lat:  51.2126
+lon:  4.4146
+
+# Area settings (used when mode = area)  [N, W, S, E]
+area:
+  north: -17.5
+  west:  -63.5
+  south: -18.25
+  east:  -62.75
+
+# ── Output ───────────────────────────────────────────────────────────────────
+output_dir:  data/${name}
+results_dir: results/${name}
+
+# ── Download backend ─────────────────────────────────────────────────────────
+# "cds"        (default) – year-by-year requests via reanalysis-era5-single-levels.
+# "timeseries" – single request per variable via reanalysis-era5-single-levels-timeseries
+#                (ARCO/Zarr backed on CDS; faster for mode=point over long periods).
+download_backend: timeseries
+download_workers: 4     # parallel CDS jobs (reserved for future use)
+
+# ── Physics constants ─────────────────────────────────────────────────────────
+roughness_length: 0.03    # m  (open farmland – adjust for your site)
+ref_height_low:   10.0    # m  (ERA-5 lowest wind level)
+ref_height_high:  100.0   # m  (ERA-5 highest single-level wind level)
+target_heights:   [10, 30, 50]  # m  – wind extrapolated to these heights via log profile
+
+# ── Statistics (used by 'stats' command) ─────────────────────────────────────
+rolling_window:   720     # hours  (~30 days); rolling mean/std window
+n_boot:           500     # bootstrap resamples for uncertainty report (95 % CI)
